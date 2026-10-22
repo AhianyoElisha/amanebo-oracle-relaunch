@@ -1,0 +1,82 @@
+name: relaunch-vps
+
+# Keeps asking Oracle for an Ampere A1 instance built from the preserved boot volume until
+# capacity appears, then attaches the reserved IP and waits for the API. Each job runs for
+# up to ~5h50m (the runner limit is 6h) and the schedule starts the next one, so coverage is
+# continuous without any laptop. After a successful launch the workflow disables itself.
+
+on:
+  schedule:
+    - cron: '7 */6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: relaunch
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  relaunch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the OCI CLI
+        run: pipx install oci-cli
+
+      - name: Configure OCI credentials from secrets
+        env:
+          OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+          LAUNCH_ENV: ${{ secrets.LAUNCH_ENV }}
+        run: |
+          mkdir -p ~/.oci && chmod 700 ~/.oci
+          printf '%s\n' "$OCI_CONFIG" | sed 's|^key_file=.*|key_file=/home/runner/.oci/oci_api_key.pem|' > ~/.oci/config
+          printf '%s\n' "$OCI_PRIVATE_KEY" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/config ~/.oci/oci_api_key.pem
+          printf '%s\n' "$LAUNCH_ENV" > launch.env
+          oci iam region list --query 'length(data)' --output json >/dev/null && echo "OCI credentials OK"
+
+      - name: Stop if the VPS already exists
+        id: existing
+        run: |
+          set -a; . ./launch.env; set +a
+          n=$(oci compute instance list --compartment-id "$COMPARTMENT_ID" --display-name "${DISPLAY_NAME:-amanebo-vps}" \
+                --query 'length(data[?"lifecycle-state"!=`TERMINATED`])' --output json)
+          echo "instances=$n" >> "$GITHUB_OUTPUT"
+          if [ "$n" != "0" ]; then echo "::notice::an instance named ${DISPLAY_NAME:-amanebo-vps} already exists; nothing to do"; fi
+
+      - name: Retry the launch until capacity appears or the deadline
+        id: launch
+        if: steps.existing.outputs.instances == '0'
+        env:
+          DEADLINE_SECONDS: 20400
+          LOG: ${{ github.workspace }}/oracle-retry.log
+        run: |
+          set +e
+          ./retry-launch.sh ./launch.env; rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          case $rc in
+            0) echo "::notice::VPS launched"; exit 0 ;;
+            3) echo "deadline reached, the next scheduled job continues"; exit 0 ;;
+            2) echo "::error::service limit, upgrade to pay-as-you-go"; exit 2 ;;
+            *) exit $rc ;;
+          esac
+
+      - name: Disable the schedule once the VPS is back
+        if: steps.launch.outputs.rc == '0' || steps.existing.outputs.instances != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow disable relaunch.yml -R "$GITHUB_REPOSITORY"
+
+      - name: Keep the attempt log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oracle-retry-log-${{ github.run_id }}
+          path: oracle-retry.log
+          if-no-files-found: ignore
